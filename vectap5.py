@@ -1,0 +1,338 @@
+# app.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import math
+import plotly.graph_objects as go
+from sklearn.decomposition import PCA
+
+# ── CONFIG ─────────────────────────────────────────────────────────────────────
+DEFAULT_CSV_PATH = "vectors.csv"
+
+st.set_page_config(
+    page_title="Stream Cross Section Visualiser",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+st.title("Stream Cross Section Visualiser")
+st.subheader("Survey Data")
+
+# ── IMPORT / LOAD CSV ──────────────────────────────────────────────────────────
+@st.cache_data
+def load_csv(path):
+    return pd.read_csv(path)
+
+uploaded = st.sidebar.file_uploader("Import Vectors CSV", type=["csv"])
+if uploaded:
+    df = pd.read_csv(uploaded)
+else:
+    df = load_csv(DEFAULT_CSV_PATH)
+
+edited = st.data_editor(df, num_rows="dynamic", use_container_width=True, height=300)
+
+if not uploaded and st.sidebar.button("Save edits to default CSV"):
+    edited.to_csv(DEFAULT_CSV_PATH, index=False)
+    st.sidebar.success(f"Saved edits to `{DEFAULT_CSV_PATH}`")
+if uploaded:
+    st.sidebar.download_button(
+        "Download edited CSV",
+        edited.to_csv(index=False).encode(),
+        "edited_vectors.csv",
+        "text/csv"
+    )
+
+# ── SIDEBAR CONTROLS ───────────────────────────────────────────────────────────
+st.sidebar.header("PCA Cross-Section")
+show_fit    = st.sidebar.checkbox("Show PCA fit", value=True)
+all_pts     = sorted(set(edited['vector point 1']) | set(edited['vector point 2']))
+default_fit = [
+    'C','F','G','H','I','J','K','L',
+    'P','Q','R','T','U','V','W','X','Y',
+    'a','b','d','f','g','h','i'
+]
+initial     = [p for p in default_fit if p in all_pts]
+fit_pts     = st.sidebar.multiselect("Points to include", all_pts, default=initial)
+flip_cross  = st.sidebar.checkbox("Flip cross-section horizontally")
+
+st.sidebar.header("Map View Controls")
+map_token = st.sidebar.text_input(
+    "Mapbox token", 
+    type="password",
+    value="pk.eyJ1IjoiY2RvbW90b3IiLCJhIjoiY21kNWlwbDVkMDAwdjJ4cTg0dDhyajg1diJ9.Z0yrFi2lmJpLDyJ8Gb9qaQ"
+)
+ref_pt    = st.sidebar.selectbox("Reference point", all_pts, index=0)
+lat0      = st.sidebar.number_input("Reference latitude", format="%.6f", value=-25.275690)
+lon0      = st.sidebar.number_input("Reference longitude", format="%.6f", value=152.508867)
+zoom      = st.sidebar.slider("Map zoom", 1, 20, 18)
+
+# ── COMPUTE LOCAL COORDS ───────────────────────────────────────────────────────
+def compute_coords(df):
+    coords = { df.iloc[0]['vector point 1']: (0.0, 0.0) }
+    rem = df.set_index('Vector index').copy()
+    while True:
+        progressed = False
+        for idx, r in rem.iterrows():
+            p1, p2 = r['vector point 1'], r['vector point 2']
+            θ, L    = math.radians(r['vector degrees at 3 point angle']), r['vector length']
+            vx, vy  = L * math.cos(θ), L * math.sin(θ)
+            if p1 in coords and p2 not in coords:
+                x, y = coords[p1]
+                coords[p2] = (x + vx, y + vy)
+                rem = rem.drop(idx); progressed = True
+            elif p2 in coords and p1 not in coords:
+                x, y = coords[p2]
+                coords[p1] = (x - vx, y - vy)
+                rem = rem.drop(idx); progressed = True
+        if not progressed:
+            break
+    if not rem.empty:
+        raise RuntimeError("Unresolved vectors")
+    return coords
+
+coords = compute_coords(edited)
+
+# ── PCA & CROSS-SECTION DATAFRAME ──────────────────────────────────────────────
+cross_df = pd.DataFrame()
+if show_fit and len(fit_pts) >= 2:
+    XY       = np.array([coords[p] for p in fit_pts])
+    pca      = PCA(n_components=1).fit(XY)
+    center, dir_vec = pca.mean_, pca.components_[0]
+    dists    = (XY - center).dot(dir_vec)
+    RL_map   = { r['vector point 2']: r['RL'] 
+                 for _, r in edited.iterrows() if pd.notna(r.get('RL')) }
+    RLs      = [RL_map.get(p, np.nan) for p in fit_pts]
+    cross_df = pd.DataFrame({
+        "xs_point_index":       np.arange(1, len(fit_pts)+1),
+        "xs_survey_point_name": fit_pts,
+        "xs_distance":          dists,
+        "RL":                   RLs
+    })
+    if flip_cross:
+        cross_df["xs_distance"] *= -1
+    cross_df = cross_df.sort_values("xs_distance").reset_index(drop=True)
+
+    st.sidebar.download_button(
+        "Download cross_section.csv",
+        data=cross_df.to_csv(index=False).encode(),
+        file_name="cross_section.csv",
+        mime="text/csv"
+    )
+
+# ── PLAN VIEW MAP ─────────────────────────────────────────────────────────────
+st.subheader("Plan view (satellite)")
+if not map_token:
+    st.warning("Enter your Mapbox token above to render the satellite map.")
+else:
+    fig = go.Figure()
+
+    # convert local → lat/lon
+    x_ref, y_ref = coords[ref_pt]
+    mlat         = 111000
+    mlon         = 111000 * math.cos(math.radians(lat0))
+    def to_latlon(pt):
+        x, y = coords[pt]
+        return lat0 + (y - y_ref)/mlat, lon0 + (x - x_ref)/mlon
+
+    # gather all point lat/lon for bounds
+    lats, lons = [], []
+    for pt in coords:
+        lat, lon = to_latlon(pt)
+        lats.append(lat); lons.append(lon)
+
+    # padding
+    west, east   = min(lons), max(lons)
+    south, north = min(lats), max(lats)
+    dx = (east - west) * 0.05
+    dy = (north - south) * 0.05
+
+    # compute midpoint of all points
+    mid_lat = (min(lats) + max(lats)) / 2
+    mid_lon = (min(lons) + max(lons)) / 2
+
+    fig.update_layout(
+        mapbox=dict(
+            accesstoken=map_token,
+            style="satellite",
+            center={"lat": mid_lat, "lon": mid_lon},
+            zoom=zoom
+        ),
+        margin=dict(l=0, r=0, t=0, b=0),
+        hovermode="closest",
+        height=800
+    )
+
+    # plot vectors
+    for idx, r in edited.iterrows():
+        p1, p2 = r['vector point 1'], r['vector point 2']
+        lat1, lon1 = to_latlon(p1)
+        lat2, lon2 = to_latlon(p2)
+        info = (
+            f"Vector {idx}: {p1}→{p2}<br>"
+            f"Len {r['vector length']:.2f}<br>"
+            f"Ang {r['vector degrees at 3 point angle']}°"
+        )
+        fig.add_trace(go.Scattermapbox(
+            lat=[lat1, lat2], lon=[lon1, lon2],
+            mode="lines", line=dict(color=r['vector colour'], width=2),
+            hoverinfo="none", name=f"{p1}→{p2}"
+        ))
+        fig.add_trace(go.Scattermapbox(
+            lat=[(lat1+lat2)/2], lon=[(lon1+lon2)/2],
+            mode="markers", marker=dict(size=10, opacity=0),
+            hoverinfo="text", hovertext=info, showlegend=False
+        ))
+
+    # plot points
+    for pt in coords:
+        lat, lon = to_latlon(pt)
+        info = f"Point {pt}<br>Lat {lat:.6f}<br>Lon {lon:.6f}"
+        fig.add_trace(go.Scattermapbox(
+            lat=[lat], lon=[lon],
+            mode="markers+text", marker=dict(size=5),
+            text=[pt], textposition="top center",
+            hoverinfo="text", hovertext=info,
+            name=f"Pt {pt}"
+        ))
+
+    # PCA fit line with hover showing along-line distance & bearing
+    if show_fit and not cross_df.empty:
+        # 1) compute along-line parameter t from dmin to dmax, with padding
+        dmin, dmax = cross_df.xs_distance.min(), cross_df.xs_distance.max()
+        pad        = (dmax - dmin) * 0.01
+        t          = np.linspace(dmin - pad, dmax + pad, 200)
+
+        # 2) build local XY of PCA line
+        line_xy = center + np.outer(t, dir_vec)
+
+        # 3) compute constant bearing from north (clockwise)
+        #    dir_vec = [dx (east), dy (north)]
+        bearing = (math.degrees(math.atan2(dir_vec[0], dir_vec[1])) + 360) % 360
+
+        # 4) convert to lat/lon
+        lat_line, lon_line = [], []
+        for x, y in line_xy:
+            lat_line.append(lat0 + (y - y_ref) / mlat)
+            lon_line.append(lon0 + (x - x_ref) / mlon)
+
+        # 5) prepare customdata: [distance_along_line, bearing]
+        #    here we just take abs(t) as distance from center-line origin
+        cum_dist   = np.abs(t)
+        customdata = np.vstack([cum_dist, np.full_like(cum_dist, bearing)]).T
+
+        # 6) draw with hovertemplate
+        fig.add_trace(go.Scattermapbox(
+            lat=lat_line,
+            lon=lon_line,
+            mode="lines+markers",
+            line=dict(color="black", width=4),
+            marker=dict(size=8, color="lime", symbol="diamond"),
+            customdata=customdata,
+            hovertemplate=(
+              "XS Length: %{customdata[0]:.1f} m<br>"
+              "Bearing: %{customdata[1]:.1f}° from N"
+              "<extra></extra>"
+            ),
+            name="PCA fit"
+        ))
+
+
+    st.plotly_chart(fig, use_container_width=True, height=800)
+
+# ── 2D PLAN VIEW OF VECTORS (NO BACKGROUND) ───────────────────────────────────
+    st.subheader("Plan view (2D vectors)")
+    fig_vec = go.Figure()
+
+    # draw each vector as a line + invisible hover‐marker
+    for idx, r in edited.iterrows():
+        p1, p2 = r['vector point 1'], r['vector point 2']
+        x1, y1 = coords[p1]
+        x2, y2 = coords[p2]
+        info = (
+            f"Vector {idx}: {p1}→{p2}<br>"
+            f"Len {r['vector length']:.2f}<br>"
+            f"Ang {r['vector degrees at 3 point angle']}°"
+        )
+        fig_vec.add_trace(go.Scatter(
+            x=[x1, x2], y=[y1, y2],
+            mode="lines",
+            line=dict(color=r['vector colour'], width=2),
+            hoverinfo="none",
+            name=f"{p1}→{p2}"
+        ))
+        fig_vec.add_trace(go.Scatter(
+            x=[(x1 + x2)/2], y=[(y1 + y2)/2],
+            mode="markers",
+            marker=dict(size=10, opacity=0),
+            hoverinfo="text",
+            hovertext=info,
+            showlegend=False
+        ))
+
+    # draw the survey points
+    for pt, (x, y) in coords.items():
+        info = f"Point {pt}<br>X: {x:.2f}<br>Y: {y:.2f}"
+        fig_vec.add_trace(go.Scatter(
+            x=[x], y=[y],
+            mode="markers+text",
+            marker=dict(size=5),
+            text=[pt],
+            textposition="top center",
+            hoverinfo="text",
+            hovertext=info,
+            showlegend=False
+        ))
+
+    # PCA fit in the 2D vectors plot
+    if show_fit and not cross_df.empty:
+        # 1) along‐line parameter
+        dmin, dmax = cross_df.xs_distance.min(), cross_df.xs_distance.max()
+        pad        = (dmax - dmin) * 0.01
+        t          = np.linspace(dmin - pad, dmax + pad, 200)
+        # 2) local XY of PCA line
+        line_xy    = center + np.outer(t, dir_vec)
+        # 3) plot
+        fig_vec.add_trace(go.Scatter(
+            x=line_xy[:,0],
+            y=line_xy[:,1],
+            mode="lines",
+            line=dict(color="black", dash="dash", width=3),
+            name="XS"
+        ))
+
+    fig_vec.update_layout(
+        xaxis=dict(title="X", constrain="domain"),
+        yaxis=dict(title="Y", scaleanchor="x"),
+        margin=dict(l=20, r=20, t=20, b=20),
+        height=600
+    )
+    st.plotly_chart(fig_vec, use_container_width=True)
+
+
+# ── CROSS-SECTION & PROFILE ───────────────────────────────────────────────────
+if not cross_df.empty:
+    st.subheader("Cross-Section Data")
+    st.dataframe(cross_df)
+
+    st.subheader("Cross-Section Profile (RL vs Distance)")
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(
+        x=cross_df.xs_distance, y=cross_df.RL,
+        mode="lines", line=dict(color="black"),
+        name="Profile", hoverinfo="x+y"
+    ))
+    for _, row in cross_df.iterrows():
+        nm, d, rl = row.xs_survey_point_name, row.xs_distance, row.RL
+        hover = f"{nm}<br>Distance: {d:.2f}<br>RL: {rl:.2f}"
+        fig2.add_trace(go.Scatter(
+            x=[d], y=[rl], mode="markers",
+            marker=dict(size=8), name=nm,
+            hoverinfo="text", hovertext=hover
+        ))
+    fig2.update_layout(
+        hovermode="x unified",
+        xaxis_title="xs_distance",
+        yaxis_title="RL",
+        height=400,
+        margin=dict(l=20,r=20,t=20,b=20)
+    )
+    st.plotly_chart(fig2, use_container_width=True)
