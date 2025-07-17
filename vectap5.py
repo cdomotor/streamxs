@@ -37,7 +37,7 @@ st.sidebar.header("PCA Cross-Section")
 show_fit   = st.sidebar.checkbox("Show PCA fit", value=True)
 all_pts    = sorted(set(df['vector point 1']) | set(df['vector point 2']))
 default_fit = [
-    'F','G','H','I','J','K','L',
+    'C','F','G','H','I','J','K','L',
     'P','Q','R','T','U','V','W','X','Y',
     'a','b','d','f','g','h','i'
 ]
